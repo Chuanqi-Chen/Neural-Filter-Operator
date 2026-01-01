@@ -1,6 +1,6 @@
 # Lorenz 63 System
+# System States: [x, y, z]
 # Observations: x
-# States: [x, y, z]
 
 import numpy as np
 import scipy as sp
@@ -59,17 +59,30 @@ test_y = torch.tensor(u[-Ntest:, :1], dtype=torch.float)
 ####################################################
 
 class NPF(nn.Module):
-    def __init__(self, input_size, hidden_size, state_size, num_layers=1):
+    def __init__(self, state_size, obs_size, hidden_size, num_layers=1, diag_cov=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.state_size = state_size
-        self.output_size = int(state_size + state_size*(state_size+1) / 2)
+        self.diag_cov = diag_cov
+        self.mean_output_size = state_size
+        if diag_cov:
+            self.cov_output_size = state_size * 2
+        else:
+            self.cov_output_size = int(state_size + state_size*(state_size+1) / 2)
 
-        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
-        self.mlp = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, self.output_size))
+        self.rnn = nn.RNN(obs_size, hidden_size, num_layers, batch_first=True)
+        self.mlp_mean = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                      nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                      nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                      nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                      nn.Linear(hidden_size, self.mean_output_size))
+
+        self.mlp_cov = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                     nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                     nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                     nn.Linear(hidden_size, hidden_size), nn.SiLU(),
+                                     nn.Linear(hidden_size, self.cov_output_size))
 
     def forward(self, y, p0=None):
         # y: (N, T, S); p0: (Num_Layers, N, hidden_size)
@@ -77,19 +90,20 @@ class NPF(nn.Module):
             p0 = torch.zeros(self.num_layers, y.shape[0], self.hidden_size, device=y.device)
             p0[..., 1] = 1.
         p, _ = self.rnn(y, p0) # out: (N, T, hidden_size)
-        m = self.mlp(p) # (N, T, output_size)
-        mean = m[..., :self.state_size]
-        cov = self.vec_to_cov(m[..., self.state_size:])
-        return [mean, cov]
+        mu = self.mlp_mean(p)
+        cov_root = self.mlp_cov(p)
+        if self.diag_cov:
+            cov = cov_root[..., self.state_size:]**2
+        else:
+            cov = self.vec_to_cov(cov_root[..., self.state_size:])
+        x_est = {"mean": mu, "cov": cov}
+        return x_est
 
     def vec_to_cov(self, v):
         d = self.state_size
         L = torch.zeros(*v.shape[:-1], d, d, device=v.device, dtype=v.dtype)
         rows, cols = torch.tril_indices(d, d, device=v.device)
         L[..., rows, cols] = v
-
-        diag_mask = torch.eye(d, device=v.device, dtype=torch.bool)
-        L[..., diag_mask] = nnF.softplus(L[..., diag_mask])
         cov = L @ L.mT
         return cov
 
@@ -98,58 +112,112 @@ class NPF(nn.Module):
 ################# Model Training #################
 ##################################################
 
-def NLL(z, est, eps=1e-6):
-    # z shape (N, T, S), est shape (N, T, [mean, cov])
-    mu = est[..., 0:1]
-    s  = est[..., 1:2]
-    var = s**2 + eps
-    nll = (z-mu)**2/var + torch.log(var)
-    return nll.mean()
+# Stage 1: Train NPF with MSE
+batch_size = 10
+batch_step = 100
+Niterations = 5000
+train_mse_history = []
 
+npf = NPF(state_size=3, obs_size=1, hidden_size=20, num_layers=1)
+optimizer = torch.optim.Adam(npf.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Niterations)
+for niter in range(Niterations):
+    indices = np.random.choice(Ntrain-batch_step, size=batch_size, replace=False)
+    batch_x = torch.stack([train_x[idx:idx+batch_step] for idx in indices])
+    batch_y = torch.stack([train_y[idx:idx+batch_step] for idx in indices])
+    batch_x_est = npf(batch_y)
+    loss = nnF.mse_loss(batch_x, batch_x_est["mean"])
+    loss.backward()
+    # torch.nn.utils.clip_grad_norm_(npf.parameters(), max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+    train_mse_history.append(loss.item())
+    print(f"niter {niter} | MSE {loss.item():.4f}")
+
+
+# Stage 2: Train NPF with NLL
+def NLL(x, est, eps=1e-6):
+    # x: (N, T, S)
+    # est: {(N, T, S), (N, T, S) or (N, T, S, S)}
+    mu = est["mean"]
+    if est["cov"].dim() == 3:
+        var = est["cov"]
+        var = nnF.softplus(var) + eps
+        nll = ( (x-mu)**2/var + torch.log(var) ).sum(dim=-1)
+    else:
+        x = x.unsqueeze(-1)
+        mu = mu.unsqueeze(-1)
+        cov = est["cov"]
+        d = cov.diagonal(dim1=-2, dim2=-1)
+        target_d = nnF.softplus(d) + eps
+        cov = cov + torch.diag_embed(target_d - d, dim1=-2, dim2=-1)
+        wmse = ((x-mu).mT @ torch.inverse(cov) @  (x-mu)).squeeze((-1, -2))
+        nll = wmse + torch.log(torch.det(cov))
+    return nll.mean()
 
 batch_size = 10
 batch_step = 100
 Niterations = 5000
-train_loss_history = []
-warmup_iter = 1000
+train_nll_history = []
 
-nfo = NFO()
-optimizer = torch.optim.Adam(nfo.parameters(), lr=1e-3)
+npf.rnn.requires_grad_(False)
+npf.mlp_mean.requires_grad_(False)
+optimizer = torch.optim.Adam(npf.mlp_cov.parameters(), lr=1e-3)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Niterations)
 for niter in range(Niterations):
     indices = np.random.choice(Ntrain-batch_step, size=batch_size, replace=False)
-    batch_obs = torch.stack([train_u[idx:idx+batch_step] for idx in indices])
-    batch_est = nfo.filter(batch_obs[..., :2])
-    batch_est = batch_est[:, 1:]  # Cut off the initial point
-    if niter < warmup_iter:
-        loss = nnF.mse_loss(batch_obs[..., 2:], batch_est[..., :1])
-    else:
-        loss = NLL(batch_obs[..., 2:], batch_est)
+    batch_x = torch.stack([train_x[idx:idx+batch_step] for idx in indices])
+    batch_y = torch.stack([train_y[idx:idx+batch_step] for idx in indices])
+    batch_x_est = npf(batch_y)
+    loss = NLL(batch_x, batch_x_est)
+
     loss.backward()
-    # torch.nn.utils.clip_grad_norm_(nfo.parameters(), max_norm=1.0)
+    # torch.nn.utils.clip_grad_norm_(npf.parameters(), max_norm=1.0)
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad()
-    train_loss_history.append(loss.item())
-    print(f"niter {niter} | loss {loss.item():.4f}")
-
+    train_nll_history.append(loss.item())
+    print(f"niter {niter} | NLL {loss.item():.4f}")
 
 
 ###################################################
 ################# Model Inference #################
 ###################################################
 
-sample_u = test_u[1000:1100].unsqueeze(0)
-sample_z = sample_u[..., 2:]
 with torch.no_grad():
-    sample_est = nfo.filter(sample_u[..., :2])
+    test_x_est = npf(test_y.unsqueeze(0))
 
-nnF.mse_loss(sample_z, sample_est[:, 1:, :1])
-sample_est[:, 1:, 1:]
+# MSE
+nnF.mse_loss(test_x.unsqueeze(0), test_x_est["mean"])
+# NLL
+NLL(test_x, test_x_est)
+
+si = 800
+ei = 1000
+t = np.arange(si, ei)
 
 fig = plt.figure()
-ax = fig.subplots()
-ax.plot(np.arange(1, 101), sample_z.flatten())
-ax.plot(np.arange(101), sample_est[..., :1].flatten())
-ax.fill_between(np.arange(0, 101), sample_est[..., :1].flatten() - 2*torch.abs(sample_est[..., 1:].flatten()), sample_est[..., :1].flatten() + 2*torch.abs(sample_est[..., 1:].flatten()), alpha=0.2)
+axs = fig.subplots(3, 1)
+x1_true = test_x[si:ei, 0]
+x1_mean = test_x_est["mean"][0, si:ei, 0]
+x1_std = torch.abs(test_x_est["cov"][0, si:ei, 0, 0])**0.5
+axs[0].plot(t, x1_true, color="black")
+axs[0].plot(t, x1_mean, color="red")
+axs[0].fill_between(t, x1_mean+2*x1_std, x1_mean-2*x1_std, color="red", alpha=0.2, label="95% Conf")
+
+x2_true = test_x[si:ei, 1]
+x2_mean = test_x_est["mean"][0, si:ei, 1]
+x2_std = torch.abs(test_x_est["cov"][0, si:ei, 1, 1])**0.5
+axs[1].plot(t, x2_true, color="black")
+axs[1].plot(t, x2_mean, color="red")
+axs[1].fill_between(t, x2_mean+2*x2_std, x2_mean-2*x2_std, color="red", alpha=0.2, label="95% Conf")
+
+x3_true = test_x[si:ei, 2]
+x3_mean = test_x_est["mean"][0, si:ei, 2]
+x3_std = torch.abs(test_x_est["cov"][0, si:ei, 2, 2])**0.5
+axs[2].plot(t, x3_true, color="black")
+axs[2].plot(t, x3_mean, color="red")
+axs[2].fill_between(t, x3_mean+2*x3_std, x3_mean-2*x3_std, color="red", alpha=0.2, label="95% Conf")
+fig.tight_layout()
 
