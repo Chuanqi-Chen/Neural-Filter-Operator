@@ -84,7 +84,12 @@ def KSE_forecast(u, dt_obs=1.):
 
 
 def gaspari_cohn(r):
-    r = np.abs(r)
+    """
+    Gaspari–Cohn localization (compactly supported correlation).
+    Input r is normalized distance: r = d / loc_radius (dimensionless).
+    Output rho in [0,1], with rho(r)=0 for r>=2.
+    """
+    r = np.abs(r).astype(float)
     rho = np.zeros_like(r)
 
     m1 = (r <= 1.0)
@@ -93,23 +98,27 @@ def gaspari_cohn(r):
     r1 = r[m1]
     r2 = r[m2]
 
+    # 0 <= r <= 1
     rho[m1] = (
-        1
+        1.0
         - (5.0/3.0) * r1**2
         + (5.0/8.0) * r1**3
         + 0.5 * r1**4
         - 0.25 * r1**5
     )
 
+    # 1 < r <= 2  (CORRECT branch)
     rho[m2] = (
-        4.0/3.0
+        4.0
         - 5.0 * r2
-        + 5.0 * r2**2
-        - (5.0/3.0) * r2**3
-        + 0.5 * r2**4
-        - (1.0/12.0) * r2**5
+        + (5.0/3.0) * r2**2
+        + (5.0/8.0) * r2**3
+        - 0.5 * r2**4
+        + (1.0/12.0) * r2**5
         - 2.0 / (3.0 * r2)
     )
+
+    # r > 2 already zero
     return rho
 
 def periodic_dist(x, y, L):
@@ -194,4 +203,5 @@ x3_mean = x_ens_mean[si:ei, 2]
 axs[2].plot(t, x3_true, color="black")
 axs[2].plot(t, x3_mean, color="red")
 # axs[2].fill_between(t, x3_mean+2*x3_std, x3_mean-2*x3_std, color="red", alpha=0.2, label="95% Conf")
+
 fig.tight_layout()
