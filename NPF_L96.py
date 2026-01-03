@@ -1,6 +1,6 @@
-# Lorenz 63 System
-# System States: [x, y, z]
-# Observations: Noisy x
+# Lorenz 96 System
+# System States: [x1, x2, ...x40]
+# Observations: Noisy [x2, x4, .., x38]
 
 import numpy as np
 import scipy as sp
@@ -27,26 +27,28 @@ np.random.seed(0)
 ################# Data Preparation #################
 ####################################################
 
-# Simulation Settings: Lt=1000, dt=0.001
-sigma, rho, beta = 10, 28, 8/3
+F = 8
 sigma_dyn = 0.5
-Lt = 1000
+
+I = 40
+Lt = 5000
 dt_sim = 0.001
 Nt_sim = int(Lt/dt_sim)
-u = np.zeros((Nt_sim, 3))
+t = np.linspace(0, Lt, Nt_sim)
+u = np.zeros((Nt_sim, I))
 # for n in range(Nt_sim-1):
 #     if n % (1/dt_sim) == 0:
 #         print(int(n*dt_sim))
-#     u[n+1, 0] = u[n, 0] + (sigma*(u[n, 1] - u[n, 0]))*dt_sim
-#     u[n+1, 1] = u[n, 1] + (u[n, 0]*(rho-u[n, 2])-u[n, 1])*dt_sim
-#     u[n+1, 2] = u[n, 2] + (u[n, 0]*u[n, 1] - beta*u[n, 2])*dt_sim
-#     u[n+1, :] = u[n+1, :] + dt_sim**sigma_dyn*np.random.randn(*u[n+1, :].shape)
-# u = u[::100] # dt_obs = 0.1
+#     for i in range(I):
+#         u_dot = -u[n, i] + u[n,(i+1)%I]*u[n,i-1] - u[n,i-2]*u[n,i-1] + F
+#         u[n+1, i] = u[n, i] + u_dot*dt_sim + sigma_dyn*dt_sim**0.5*np.random.randn()
+# u = u[::50]  # dt_obs = 0.05
+
 
 # Measurement Noise
-# sigma_obs = 2.
+# sigma_obs = 1.
 # u = u + sigma_obs*np.random.randn(*u.shape)
-u = np.load("./data/L63_data.npy")
+u = np.load("./data/L96_data.npy")
 
 
 # Train/Test & State/Observation
@@ -55,8 +57,8 @@ Ntrain = int(Nt_obs*0.8)
 Ntest = int(Nt_obs*0.2)
 train_x = torch.tensor(u[:Ntrain], dtype=torch.float)
 test_x = torch.tensor(u[-Ntest:], dtype=torch.float)
-train_y = torch.tensor(u[:Ntrain, :1], dtype=torch.float)
-test_y = torch.tensor(u[-Ntest:, :1], dtype=torch.float)
+train_y = torch.tensor(u[:Ntrain, ::2], dtype=torch.float)
+test_y = torch.tensor(u[-Ntest:, ::2], dtype=torch.float)
 
 
 ####################################################
@@ -118,6 +120,7 @@ class NPF(nn.Module):
         def forward(self, x):
             return self.ffn(x)
 
+
 ##################################################
 ################# Model Training #################
 ##################################################
@@ -128,7 +131,8 @@ batch_step = 100
 Niterations = 5000
 train_mse_history = []
 
-npf = NPF(state_size=3, obs_size=1, hidden_size=20, num_layers=1, mean_width=20, mean_depth=5, cov_width=20, cov_depth=5, diag_cov=False)
+
+npf = NPF(state_size=40, obs_size=20, hidden_size=256, num_layers=1, mean_width=256, mean_depth=7, cov_width=256, cov_depth=7, diag_cov=True)
 optimizer = torch.optim.Adam(npf.parameters(), lr=1e-3)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Niterations)
 for niter in range(Niterations):
@@ -196,12 +200,12 @@ for niter in range(Niterations):
 ###################################################
 
 with torch.no_grad():
-    test_x_est = npf(test_y.unsqueeze(0))
+    train_x_est = npf(train_y.unsqueeze(0))
 
 # MSE
-nnF.mse_loss(test_x.unsqueeze(0), test_x_est["mean"])
+nnF.mse_loss(train_x.unsqueeze(0), train_x_est["mean"])
 # NLL
-NLL(test_x, test_x_est)
+NLL(train_x, train_x_est)
 
 
 si = 800
@@ -210,26 +214,25 @@ t = np.arange(si, ei)
 
 fig = plt.figure()
 axs = fig.subplots(3, 1)
-x1_true = test_x[si:ei, 0]
-x1_mean = test_x_est["mean"][0, si:ei, 0]
-x1_std = torch.abs(test_x_est["cov"][0, si:ei, 0, 0])**0.5
+x1_true = train_x[si:ei, 0]
+x1_mean = train_x_est["mean"][0, si:ei, 0]
+x1_std = torch.abs(train_x_est["cov"][0, si:ei, 0])**0.5
 axs[0].plot(t, x1_true, color="black")
 axs[0].plot(t, x1_mean, color="red")
 axs[0].fill_between(t, x1_mean+2*x1_std, x1_mean-2*x1_std, color="red", alpha=0.2, label="95% Conf")
 
-x2_true = test_x[si:ei, 1]
-x2_mean = test_x_est["mean"][0, si:ei, 1]
-x2_std = torch.abs(test_x_est["cov"][0, si:ei, 1, 1])**0.5
+x2_true = train_x[si:ei, 1]
+x2_mean = train_x_est["mean"][0, si:ei, 1]
+x2_std = torch.abs(train_x_est["cov"][0, si:ei, 1])**0.5
 axs[1].plot(t, x2_true, color="black")
 axs[1].plot(t, x2_mean, color="red")
 axs[1].fill_between(t, x2_mean+2*x2_std, x2_mean-2*x2_std, color="red", alpha=0.2, label="95% Conf")
 
-x3_true = test_x[si:ei, 2]
-x3_mean = test_x_est["mean"][0, si:ei, 2]
-x3_std = torch.abs(test_x_est["cov"][0, si:ei, 2, 2])**0.5
+x3_true = train_x[si:ei, 2]
+x3_mean = train_x_est["mean"][0, si:ei, 2]
+x3_std = torch.abs(train_x_est["cov"][0, si:ei, 2])**0.5
 axs[2].plot(t, x3_true, color="black")
 axs[2].plot(t, x3_mean, color="red")
 axs[2].fill_between(t, x3_mean+2*x3_std, x3_mean-2*x3_std, color="red", alpha=0.2, label="95% Conf")
 fig.tight_layout()
-
 
