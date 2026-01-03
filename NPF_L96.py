@@ -106,14 +106,14 @@ class NPF(nn.Module):
         return cov
 
     class FFN(nn.Module):
-        def __init__(self, input_dim, width, depth, output_dim, activation=nn.SiLU):
+        def __init__(self, input_dim, width, depth, output_dim, act_fn=nn.SiLU):
             super().__init__()
             layers = []
             layers.append(nn.Linear(input_dim, width))
-            layers.append(activation())
+            layers.append(act_fn())
             for _ in range(depth-2):
                 layers.append(nn.Linear(width, width))
-                layers.append(activation())
+                layers.append(act_fn())
             layers.append(nn.Linear(width, output_dim))
             self.ffn = nn.Sequential(*layers)
 
