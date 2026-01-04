@@ -40,7 +40,7 @@ u = np.zeros((Nt_sim, 3))
 #     u[n+1, 0] = u[n, 0] + (sigma*(u[n, 1] - u[n, 0]))*dt_sim
 #     u[n+1, 1] = u[n, 1] + (u[n, 0]*(rho-u[n, 2])-u[n, 1])*dt_sim
 #     u[n+1, 2] = u[n, 2] + (u[n, 0]*u[n, 1] - beta*u[n, 2])*dt_sim
-#     u[n+1, :] = u[n+1, :] + dt_sim**sigma_dyn*np.random.randn(*u[n+1, :].shape)
+#     u[n+1, :] = u[n+1, :] + dt_sim**0.5*sigma_dyn*np.random.randn(*u[n+1, :].shape)
 # u = u[::100] # dt_obs = 0.1
 
 # Measurement Noise
